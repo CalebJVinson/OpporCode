@@ -2,21 +2,29 @@ from datamodel import TradingState, Order
 from dataclasses import dataclass, field
 from collections import deque
 import json
+import math
 
 
 positionLimit = 80
 
-ashQuoteSize = 4
+ashQuoteSize = 8
 ashBaseHalfSpread = 2
 ashFallbackValue = 10000.0
 
 rollingWindow = 120
+centerBlend = 0.3
+
+zWindow = 40
+mildZ = 0.75
+strongZ = 1.5
 
 
 @dataclass
 class AshState:
     mids: deque = field(default_factory=lambda: deque(maxlen=rollingWindow))
+    fairValues: deque = field(default_factory=lambda: deque(maxlen=rollingWindow))
     lastFairValue: float = 0.0
+    quoteCenter: float = ashFallbackValue
 
     def observe(self, mid, microprice, bidPresent, askPresent):
         if mid > 0:
@@ -27,22 +35,54 @@ class AshState:
         elif mid > 0:
             self.lastFairValue = mid
 
+        currentFairValue = self.fairValue(ashFallbackValue)
+        self.fairValues.append(currentFairValue)
+
+        if self.quoteCenter <= 0:
+            self.quoteCenter = currentFairValue
+        else:
+            self.quoteCenter = (1.0 - centerBlend) * self.quoteCenter + centerBlend * currentFairValue
+
     def fairValue(self, fallback):
         if self.lastFairValue > 0:
             return self.lastFairValue
         return fallback
 
+    def currentQuoteCenter(self, fallback):
+        if self.quoteCenter > 0:
+            return self.quoteCenter
+        return self.fairValue(fallback)
+
+    def zScore(self):
+        if len(self.fairValues) < zWindow:
+            return 0.0
+
+        recent = list(self.fairValues)[-zWindow:]
+        mean = sum(recent) / len(recent)
+        variance = sum((value - mean) ** 2 for value in recent) / len(recent)
+        stdev = math.sqrt(variance)
+
+        if stdev < 1e-6:
+            return 0.0
+
+        currentValue = recent[-1]
+        return (currentValue - mean) / stdev
+
     def toDict(self):
         return {
             "mids": list(self.mids),
+            "fairValues": list(self.fairValues),
             "lastFairValue": self.lastFairValue,
+            "quoteCenter": self.quoteCenter,
         }
 
     @classmethod
     def fromDict(cls, data):
         state = cls()
         state.mids = deque(data.get("mids", []), maxlen=rollingWindow)
+        state.fairValues = deque(data.get("fairValues", []), maxlen=rollingWindow)
         state.lastFairValue = float(data.get("lastFairValue", 0.0))
+        state.quoteCenter = float(data.get("quoteCenter", ashFallbackValue))
         return state
 
 
@@ -95,12 +135,43 @@ def makeAshOrders(product, depth, ashState, position):
     bidPresent, askPresent, mid, microprice = getBookStats(depth, ashState.fairValue(ashFallbackValue))
     ashState.observe(mid, microprice, bidPresent, askPresent)
 
-    fairValue = ashState.fairValue(ashFallbackValue)
+    fairValue = ashState.currentQuoteCenter(ashFallbackValue)
+    zScore = ashState.zScore()
+
+    bidHalfSpread = ashBaseHalfSpread
+    askHalfSpread = ashBaseHalfSpread
+    bidSize = ashQuoteSize
+    askSize = ashQuoteSize
+
+    # Mean-reversion posture:
+    # high positive z => price rich => favor selling
+    # high negative z => price cheap => favor buying
+    if zScore >= strongZ:
+        bidHalfSpread = ashBaseHalfSpread + 1
+        askHalfSpread = max(1, ashBaseHalfSpread - 1)
+        bidSize = max(1, ashQuoteSize - 2)
+        askSize = ashQuoteSize + 2
+    elif zScore >= mildZ:
+        bidHalfSpread = ashBaseHalfSpread + 1
+        askHalfSpread = ashBaseHalfSpread
+        bidSize = max(1, ashQuoteSize - 1)
+        askSize = ashQuoteSize + 1
+    elif zScore <= -strongZ:
+        bidHalfSpread = max(1, ashBaseHalfSpread - 1)
+        askHalfSpread = ashBaseHalfSpread + 1
+        bidSize = ashQuoteSize + 2
+        askSize = max(1, ashQuoteSize - 2)
+    elif zScore <= -mildZ:
+        bidHalfSpread = ashBaseHalfSpread
+        askHalfSpread = ashBaseHalfSpread + 1
+        bidSize = ashQuoteSize + 1
+        askSize = max(1, ashQuoteSize - 1)
+
     lean = inventoryLean(position)
     reservationPrice = fairValue - lean
 
-    bidPrice = int(round(reservationPrice - ashBaseHalfSpread))
-    askPrice = max(bidPrice + 1, int(round(reservationPrice + ashBaseHalfSpread)))
+    bidPrice = int(round(reservationPrice - bidHalfSpread))
+    askPrice = max(bidPrice + 1, int(round(reservationPrice + askHalfSpread)))
 
     roomToBuy = max(0, positionLimit - position)
     roomToSell = max(0, positionLimit + position)
@@ -108,12 +179,10 @@ def makeAshOrders(product, depth, ashState, position):
     orders = []
 
     if bidPresent and roomToBuy > 0:
-        buySize = min(ashQuoteSize, roomToBuy)
-        orders.append(Order(product, bidPrice, buySize))
+        orders.append(Order(product, bidPrice, min(bidSize, roomToBuy)))
 
     if askPresent and roomToSell > 0:
-        sellSize = min(ashQuoteSize, roomToSell)
-        orders.append(Order(product, askPrice, -sellSize))
+        orders.append(Order(product, askPrice, -min(askSize, roomToSell)))
 
     return orders
 
